@@ -3,6 +3,7 @@
 #
 #   wtclone <url> [dir]                 clone repo into a bare container
 #   wta <branch> [base] [--name dir]   create a worktree for a branch
+#   wtshare add <file>... | sync       share gitignored files across worktrees
 #   wtl                                list worktrees: name + branch
 #   wtcd [--branch=b|--name=n|arg]     cd into a worktree
 #   wtrm <name|branch> [-f]            remove a worktree
@@ -38,6 +39,49 @@ _wt_session() {  # tmux session name: <container>/<worktree>
                  "$(printf '%s' "$2" | tr ':.' '--')"
 }
 
+# --- shared gitignored-file store ------------------------------------------
+# One container-level store, <container>/.shared, holds the REAL gitignored
+# files; every worktree gets relative symlinks back to it, so edits persist
+# across branches (like a single-folder repo). .shared/.manifest lists the
+# shared paths (relative to a worktree root). Managed via `wtshare`.
+
+_wt_git_exclude() {  # anchor /rel in info/exclude so a symlinked ignored *dir*
+  local rel=$1 common ex                      # (e.g. node_modules) isn't seen as
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  [ -n "$common" ] || return 0               # untracked — trailing-slash .gitignore
+  ex="$common/info/exclude"                   # patterns don't match symlinks.
+  mkdir -p "$(dirname "$ex")"
+  grep -qxF -- "/$rel" "$ex" 2>/dev/null || printf '/%s\n' "$rel" >> "$ex"
+}
+
+_wt_link_shared() {  # (store, wt, rel) → relative symlink wt/rel → store/rel
+  local store=$1 wt=$2 rel=$3
+  rel=${rel#/}; rel=${rel%/}
+  [ -n "$rel" ] || return 0
+  [ -e "$store/$rel" ] || { echo "  ⚠ not in store, skipping: $rel" >&2; return 0; }
+  if [ -L "$wt/$rel" ]; then
+    rm "$wt/$rel"
+  elif [ -e "$wt/$rel" ]; then
+    echo "  ⚠ skip $rel (real file exists in worktree)" >&2; return 0
+  fi
+  # one '../' per path segment in rel gets us from the link's dir to the
+  # worktree root; '.shared' is a sibling of every worktree.
+  local n; n=$(printf '%s' "$rel" | awk -F/ '{print NF}')
+  local prefix="" i=0
+  while [ "$i" -lt "$n" ]; do prefix="../$prefix"; i=$((i + 1)); done
+  mkdir -p "$wt/$(dirname "$rel")"
+  ln -s "${prefix}.shared/$rel" "$wt/$rel"
+  _wt_git_exclude "$rel"
+}
+
+_wt_link_all() {  # (store, wt) → symlink every manifest entry into wt
+  local store=$1 wt=$2 mf="$1/.manifest" rel
+  [ -f "$mf" ] || return 0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] && _wt_link_shared "$store" "$wt" "$rel"
+  done < "$mf"
+}
+
 # --- 1) clone --------------------------------------------------------------
 
 wtclone() {
@@ -56,7 +100,10 @@ wtclone() {
   local def; def=$(_wt_default_base)          # origin/main
   local defbr=${def#origin/}                  # main
   git worktree add "$defbr" "$defbr" >/dev/null || return 1
+
+  mkdir -p .shared                            # shared gitignored-file store
   echo "🌳 $name ready: worktree '$defbr' → branch $defbr"
+  echo "   .shared/ store created — register files with: wtshare add <file>"
 }
 
 # --- 2) create worktree -----------------------------------------------------
@@ -127,12 +174,10 @@ wta() {
     echo "＋ created branch $branch from $from"
   fi
 
-  # local configs from the default worktree that aren't tracked in git
-  local defbr; defbr=$(_wt_default_base); defbr=${defbr#origin/}
-  local f
-  for f in .env .env.local docker-compose.override.yml; do
-    [ -f "$root/$defbr/$f" ] && [ ! -f "$dir/$f" ] && cp "$root/$defbr/$f" "$dir/"
-  done
+  # link shared gitignored files (.env, secrets, node_modules, ...) from the
+  # container store into the new worktree. Populate the store with `wtshare`.
+  local store="$root/.shared"
+  [ -d "$store" ] && _wt_link_all "$store" "$dir"
 
   echo "🌳 $dir"
   cd "$dir" || return 1
@@ -144,6 +189,63 @@ wta() {
     tmux new-session -d -s "$sess" -c "$dir" 2>/dev/null
     tmux switch-client -t "=$sess"
   fi
+}
+
+# --- 2b) shared gitignored files -------------------------------------------
+
+wtshare() {
+  local sub=${1:-}
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    add)  _wtshare_add "$@" ;;
+    sync) _wtshare_sync ;;
+    ""|-h|--help|help)
+      echo "usage: wtshare add <file>...   move file(s) into .shared, symlink back"
+      echo "       wtshare sync            recreate this worktree's symlinks from .shared"
+      [ "$sub" = "" ] && return 1 || return 0 ;;
+    *)  echo "✗ unknown subcommand: $sub (try: wtshare add|sync)"; return 1 ;;
+  esac
+}
+
+_wtshare_add() {
+  [ -n "${1:-}" ] || { echo "usage: wtshare add <file>..."; return 1; }
+  local root top store mf
+  root=$(_wt_root) || return 1
+  top=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || { echo "✗ not inside a worktree"; return 1; }
+  top=$(cd "$top" && pwd -P)
+  store="$root/.shared"; mkdir -p "$store"; mf="$store/.manifest"
+
+  local f dir base abs rel
+  for f in "$@"; do
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then echo "✗ no such file: $f"; continue; fi
+    dir=$(cd "$(dirname "$f")" 2>/dev/null && pwd -P) || { echo "✗ bad path: $f"; continue; }
+    base=$(basename "$f"); abs="$dir/$base"
+    case "$abs/" in
+      "$top"/*) ;;
+      *) echo "✗ $f is not inside the current worktree ($top)"; continue ;;
+    esac
+    rel=${abs#"$top"/}
+    if [ -L "$abs" ]; then echo "= $rel already a symlink, skipping"; continue; fi
+    if [ -e "$store/$rel" ]; then echo "✗ $rel already in store"; continue; fi
+    mkdir -p "$store/$(dirname "$rel")"
+    mv "$abs" "$store/$rel" || { echo "✗ move failed: $rel"; continue; }
+    grep -qxF -- "$rel" "$mf" 2>/dev/null || printf '%s\n' "$rel" >> "$mf"
+    _wt_link_shared "$store" "$top" "$rel"
+    echo "→ shared $rel  (moved to .shared, symlinked here)"
+  done
+}
+
+_wtshare_sync() {
+  local root top store
+  root=$(_wt_root) || return 1
+  top=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || { echo "✗ not inside a worktree"; return 1; }
+  top=$(cd "$top" && pwd -P)
+  store="$root/.shared"
+  [ -d "$store" ] || { echo "✗ no shared store at $store"; return 1; }
+  _wt_link_all "$store" "$top"
+  echo "✓ synced shared files into $(basename "$top")"
 }
 
 # --- 3) list ----------------------------------------------------------------
@@ -255,6 +357,7 @@ at once, side by side. No stash-and-switch. Layout:
   myrepo/          <- container
   ├── .bare/       <- the actual git data
   ├── .git         <- file: "gitdir: ./.bare"
+  ├── .shared/     <- shared gitignored files (see wtshare)
   ├── main/        <- worktree, branch main
   └── feat-x/      <- worktree, branch feat-x
 
@@ -271,8 +374,18 @@ COMMANDS
         wta hotfix main            # new branch off main
         wta feat/foo --name foo    # dir 'foo' instead of 'feat-foo'
       Existing local branch -> reuse; only on origin -> tracking branch;
-      nowhere -> create from base. Copies .env / .env.local /
-      docker-compose.override.yml from the default worktree.
+      nowhere -> create from base. Symlinks shared gitignored files from
+      the container's .shared store (see wtshare) into the new worktree.
+
+  wtshare add <file>...
+      Move gitignored file(s) into the container's .shared store and
+      replace them with symlinks. Shared across every worktree, so edits
+      persist regardless of branch. Recorded in .shared/.manifest.
+        wtshare add .env
+        wtshare add .env node_modules   # whole dirs too
+  wtshare sync
+      (Re)create this worktree's symlinks from .shared — use after adding
+      files elsewhere, or if a worktree's links went missing.
 
   wtl
       List worktrees (name + branch).
