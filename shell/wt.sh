@@ -4,18 +4,33 @@
 #   wtclone <url> [dir]                 clone repo into a bare container
 #   wta <branch> [base] [--name dir]   create a worktree for a branch
 #   wtshare add <file>... | sync       share gitignored files across worktrees
-#   wtl                                list worktrees: name + branch
-#   wtcd [--branch=b|--name=n|arg]     cd into a worktree
+#   wtl [-a|dir]                       list worktrees: name + branch
+#   wtcd [container] [name|branch]     cd into a worktree (any registered repo)
 #   wtrm <name|branch> [-f]            remove a worktree
+#   wtreg [name]                       register current container in the registry
 #   wthelp                             print this usage guide
+
+# machine-global container registry (name<TAB>path) lives next to the real
+# script file so every shell shares it; override with WT_REGISTRY.
+if [ -z "${WT_REGISTRY:-}" ]; then
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    WT_REGISTRY="$(dirname "$(readlink -f "${(%):-%x}")")/.wt-registry"
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    WT_REGISTRY="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.wt-registry"
+  else
+    WT_REGISTRY="$HOME/.wt-registry"
+  fi
+fi
 
 # --- helpers ---------------------------------------------------------------
 
-_wt_root() {  # container root (directory holding .bare)
-  local common
+_wt_root() {  # container root (directory holding .bare); self-registers it
+  local common root
   common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
     || { echo "✗ not inside a git repository" >&2; return 1; }
-  dirname "$common"
+  root=$(dirname "$common")
+  _wt_reg_add "$(basename "$root")" "$root"
+  printf '%s\n' "$root"
 }
 
 _wt_default_base() {  # origin/<default-branch>, e.g. origin/main
@@ -37,6 +52,45 @@ _wt_session() {  # tmux session name: <container>/<worktree>
   # separator and only sanitize those two chars within each component.
   printf '%s/%s' "$(printf '%s' "$1" | tr ':.' '--')" \
                  "$(printf '%s' "$2" | tr ':.' '--')"
+}
+
+# --- container registry ------------------------------------------------------
+# Machine-global map of known containers (name<TAB>path in $WT_REGISTRY) so
+# wtcd/wtl reach any repo from anywhere: `wtcd payx PAYX-1190`. Containers
+# self-register on wtclone and whenever wt commands run inside them; only
+# containers are stored — worktrees are always read live from git, so the
+# registry can't go stale on branch churn. Same basename twice → last used wins.
+
+_wt_reg_add() {  # (name, path) → upsert registry entry
+  local name=$1 root=$2 tmp
+  [ -n "$name" ] && [ -n "$root" ] || return 0
+  grep -qxF "$name	$root" "$WT_REGISTRY" 2>/dev/null && return 0
+  tmp="$WT_REGISTRY.tmp.$$"
+  { [ -f "$WT_REGISTRY" ] && awk -F'\t' -v n="$name" '$1 != n' "$WT_REGISTRY"
+    printf '%s\t%s\n' "$name" "$root"; } > "$tmp" && mv "$tmp" "$WT_REGISTRY"
+}
+
+_wt_reg_del() {  # (name) → drop registry entry
+  local tmp="$WT_REGISTRY.tmp.$$"
+  [ -f "$WT_REGISTRY" ] || return 0
+  awk -F'\t' -v n="$1" '$1 != n' "$WT_REGISTRY" > "$tmp" && mv "$tmp" "$WT_REGISTRY"
+}
+
+_wt_reg_lookup() {  # (name) → container path; prunes entries whose path is gone
+  local root
+  [ -f "$WT_REGISTRY" ] || return 1
+  root=$(awk -F'\t' -v n="$1" '$1 == n {print $2; exit}' "$WT_REGISTRY")
+  [ -n "$root" ] || return 1
+  [ -e "$root/.git" ] || {
+    _wt_reg_del "$1"
+    echo "⚠ dropped stale registry entry: $1 → $root" >&2
+    return 1
+  }
+  printf '%s\n' "$root"
+}
+
+_wt_reg_ls() {  # print registered containers
+  [ -f "$WT_REGISTRY" ] && awk -F'\t' '{printf "  %-20s %s\n", $1, $2}' "$WT_REGISTRY"
 }
 
 # --- shared gitignored-file store ------------------------------------------
@@ -102,6 +156,7 @@ wtclone() {
   git worktree add "$defbr" "$defbr" >/dev/null || return 1
 
   mkdir -p .shared                            # shared gitignored-file store
+  _wt_reg_add "$(basename "$PWD")" "$PWD"
   echo "🌳 $name ready: worktree '$defbr' → branch $defbr"
   echo "   .shared/ store created — register files with: wtshare add <file>"
 }
@@ -250,21 +305,33 @@ _wtshare_sync() {
 
 # --- 3) list ----------------------------------------------------------------
 
-wtl() {
-  git worktree list --porcelain | awk '
-    /^worktree /  { path=$2; n=split(path, a, "/"); name=a[n] }
-    /^bare$/      { name="" }
-    /^branch /    { sub("refs/heads/", "", $2)
-                    if (name != "") printf "%-28s %s\n", name, $2 }
-    /^detached$/  { if (name != "") printf "%-28s %s\n", name, "(detached HEAD)" }
-  '
+wtl() {  # [dir] — list that repo's worktrees; -a|--all — every registered container
+  case "${1:-}" in
+    -a|--all)
+      [ -f "$WT_REGISTRY" ] || { echo "(no registered containers yet)"; return 0; }
+      local name root
+      while IFS='	' read -r name root; do
+        printf '%s → %s\n' "$name" "$root"
+        wtl "$root" | sed 's/^/  /'
+      done < "$WT_REGISTRY"
+      ;;
+    *)
+      git -C "${1:-.}" worktree list --porcelain 2>/dev/null | awk '
+        /^worktree /  { path=$2; n=split(path, a, "/"); name=a[n] }
+        /^bare$/      { name="" }
+        /^branch /    { sub("refs/heads/", "", $2)
+                        if (name != "") printf "%-28s %s\n", name, $2 }
+        /^detached$/  { if (name != "") printf "%-28s %s\n", name, "(detached HEAD)" }
+      '
+      ;;
+  esac
 }
 
 # --- find worktree ----------------------------------------------------------
 
-_wt_find() {  # _wt_find <name|""> <branch|""> → worktree path
-  local name=$1 branch=$2
-  git worktree list --porcelain | awk -v n="$name" -v b="$branch" '
+_wt_find() {  # _wt_find <name|""> <branch|""> [container-dir] → worktree path
+  local name=$1 branch=$2 dir=${3:-.}
+  git -C "$dir" worktree list --porcelain 2>/dev/null | awk -v n="$name" -v b="$branch" '
     /^worktree /{p=$2; k=split(p, a, "/"); dir=a[k]}
     /^bare$/    {dir=""}
     /^branch /  {sub("refs/heads/", "", $2)
@@ -276,7 +343,7 @@ _wt_find() {  # _wt_find <name|""> <branch|""> → worktree path
 # --- 5) navigate ------------------------------------------------------------
 
 wtcd() {
-  local name="" branch="" arg=""
+  local name="" branch="" arg="" repo=""
   while [ $# -gt 0 ]; do
     case $1 in
       --branch=*) branch=${1#--branch=}; shift ;;
@@ -284,28 +351,53 @@ wtcd() {
       --branch)   branch=$2; shift 2 ;;
       --name)     name=$2;   shift 2 ;;
       -*) echo "✗ unknown flag: $1"; return 1 ;;
-      *)  arg=$1; shift ;;
+      *)  if   [ -z "$arg"  ]; then arg=$1
+          elif [ -z "$repo" ]; then repo=$arg; arg=$1
+          else echo "✗ extra argument: $1"; return 1; fi
+          shift ;;
     esac
   done
-  [ -n "$name$branch$arg" ] || { echo "usage: wtcd [--branch=b] [--name=n] [name|branch]"; return 1; }
+  [ -n "$name$branch$arg" ] || { echo "usage: wtcd [container] [--branch=b] [--name=n] [name|branch]"; return 1; }
+
+  # two positionals → first is a registered container: search its worktrees
+  # instead of the current repo's, so this works from anywhere on the machine.
+  local root=""
+  if [ -n "$repo" ]; then
+    root=$(_wt_reg_lookup "$repo") \
+      || { echo "✗ unknown container: $repo — registered:"; _wt_reg_ls; return 1; }
+  fi
 
   # NB: not named 'path' — in zsh 'path' is tied to $PATH, so a local would
   # wipe PATH inside this function and break git/awk in subshells.
   local wt
   if [ -n "$name" ] || [ -n "$branch" ]; then
-    wt=$(_wt_find "$name" "$branch")
+    wt=$(_wt_find "$name" "$branch" "$root")
   else
-    wt=$(_wt_find "$arg" "$arg")   # positional: name OR branch
+    wt=$(_wt_find "$arg" "$arg" "$root")   # positional: name OR branch
   fi
-  [ -n "$wt" ] || { echo "✗ worktree not found:"; wtl; return 1; }
+
+  # lone argument with no local match → maybe a registered container:
+  # jump to its default-branch worktree (or the container root itself).
+  if [ -z "$wt" ] && [ -z "$repo" ] && [ -n "$arg" ]; then
+    root=$(_wt_reg_lookup "$arg" 2>/dev/null) && {
+      local defbr
+      defbr=$(git -C "$root" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)
+      defbr=${defbr#refs/remotes/origin/}
+      [ -n "$defbr" ] && wt=$(_wt_find "$defbr" "$defbr" "$root")
+      [ -n "$wt" ] || wt=$root
+    }
+  fi
+
+  [ -n "$wt" ] || { echo "✗ worktree not found:"; wtl "$root"; return 1; }
 
   cd "$wt" || return 1
 
-  # if we're in tmux and a session for this worktree exists — switch to it.
-  # session name is built the same way wta creates it: <container>/<worktree>.
+  # if we're in tmux — switch to the worktree's session, creating it first
+  # if missing. Session name matches what wta creates: <container>/<worktree>.
   if [ -n "${TMUX:-}" ]; then
     local sess; sess=$(_wt_session "$(basename "$(dirname "$wt")")" "$(basename "$wt")")
-    tmux has-session -t "=$sess" 2>/dev/null && tmux switch-client -t "=$sess"
+    tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$wt"
+    tmux switch-client -t "=$sess"
   fi
 }
 
@@ -343,6 +435,16 @@ wtrm() {
   # git worktree remove releases the branch checkout itself — no detach needed.
   git worktree remove ${force:+--force} "$wt" || return 1
   echo "✓ removed worktree $wt (branch kept)"
+}
+
+# --- 7) register -------------------------------------------------------------
+
+wtreg() {  # [name] — register the current container in $WT_REGISTRY
+  local root name
+  root=$(_wt_root) || return 1
+  name=${1:-$(basename "$root")}
+  _wt_reg_add "$name" "$root"
+  echo "✓ registered: $name → $root"
 }
 
 # --- 6) help ----------------------------------------------------------------
@@ -387,14 +489,16 @@ COMMANDS
       (Re)create this worktree's symlinks from .shared — use after adding
       files elsewhere, or if a worktree's links went missing.
 
-  wtl
-      List worktrees (name + branch).
+  wtl [-a|dir]
+      List worktrees (name + branch). -a: every registered container.
 
-  wtcd [name|branch]
-      Jump between worktrees.
-        wtcd feat-login            # by dir name OR branch
+  wtcd [container] [name|branch]
+      Jump between worktrees — of this repo, or any registered one.
+        wtcd feat-login            # by dir name OR branch (current repo)
         wtcd --branch=feat-login   # force branch match
         wtcd --name=foo            # force dir-name match
+        wtcd payx PAYX-1190        # from anywhere: repo 'payx', wt 'PAYX-1190'
+        wtcd payx                  # repo 'payx', default-branch worktree
 
   wtrm <name|branch> [-f]
       Remove a worktree. Branch is KEPT (never deleted). Prompts if dirty;
@@ -402,12 +506,25 @@ COMMANDS
         wtrm feat-login
         wtrm feat-login -f
 
+  wtreg [name]
+      Register the current container in the registry (run from the
+      container folder or any of its worktrees). Default name = folder
+      name; pass a name to register an alias.
+        wtreg                      # register as folder name
+        wtreg px                   # alias: wtcd px PAYX-1190
+
   wthelp
       Print this guide.
 
-tmux: inside tmux, wta spawns + switches to a session per worktree (named
-<container>/<worktree>), and wtcd switches to it if it exists. Outside
-tmux, ignored.
+tmux: inside tmux, wta and wtcd both switch to the worktree's session
+(named <container>/<worktree>), creating it if missing. Outside tmux,
+ignored.
+
+registry: containers self-register (on wtclone and whenever wt commands
+run inside them) into $WT_REGISTRY — a name<TAB>path file next to the
+real wt.sh — so wtcd/wtl -a work machine-wide. Only containers are
+stored; worktrees are read live from git. Same dir name twice -> last
+used wins. Override location: export WT_REGISTRY=... before sourcing.
 
 TYPICAL FLOW
   wtclone git@github.com:you/repo.git   # once
