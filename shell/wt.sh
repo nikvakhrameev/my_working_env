@@ -2,6 +2,7 @@
 # Install: source ~/wt.sh from .zshrc/.bashrc
 #
 #   wtclone <url> [dir]                 clone repo into a bare container
+#   wtconvert [--name dir]             convert a normal repo into a container
 #   wta <branch> [base] [--name dir]   create a worktree for a branch
 #   wtshare add <file>... | sync       share gitignored files across worktrees
 #   wtl [-a|dir]                       list worktrees: name + branch
@@ -159,6 +160,83 @@ wtclone() {
   _wt_reg_add "$(basename "$PWD")" "$PWD"
   echo "🌳 $name ready: worktree '$defbr' → branch $defbr"
   echo "   .shared/ store created — register files with: wtshare add <file>"
+}
+
+# --- 1b) convert ------------------------------------------------------------
+
+wtconvert() {  # convert a normal (non-bare) repo into a container, in place
+  local name=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --name)   name=$2; shift 2 ;;
+      --name=*) name=${1#--name=}; shift ;;
+      -h|--help) echo "usage: wtconvert [--name dir]   (run from inside the repo)"; return 0 ;;
+      *) echo "✗ unknown argument: $1 (usage: wtconvert [--name dir])"; return 1 ;;
+    esac
+  done
+
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || { echo "✗ not inside a git repository (with a work tree)"; return 1; }
+  root=$(cd "$root" && pwd -P)
+  [ -d "$root/.git" ] \
+    || { echo "✗ $root/.git is not a directory — already a worktree or container?"; return 1; }
+  git -C "$root" rev-parse --verify --quiet HEAD >/dev/null \
+    || { echo "✗ repository has no commits yet"; return 1; }
+
+  local branch
+  branch=$(git -C "$root" symbolic-ref --quiet --short HEAD) \
+    || { echo "✗ detached HEAD — check out a branch first"; return 1; }
+  [ -n "$name" ] || name=$(_wt_sanitize "$branch")
+  [ -e "$root/$name" ] \
+    && { echo "✗ $root/$name already exists — pick a dir: wtconvert --name <dir>"; return 1; }
+  [ -e "$root/.bare" ] && { echo "✗ $root/.bare already exists"; return 1; }
+
+  if [ -f "$root/.gitmodules" ]; then
+    printf "⚠ submodules detected; their .git links will break and need re-init after converting. Continue? [y/N] "
+    local ans; read -r ans
+    [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "cancelled"; return 1; }
+  fi
+
+  local rel=${PWD#"$root"}  # land in the same spot inside the new worktree
+
+  # the repo's .git dir becomes the bare store, same shape wtclone produces
+  mv "$root/.git" "$root/.bare" || return 1
+  printf 'gitdir: ./.bare\n' > "$root/.git"
+  git -C "$root" config core.bare true
+  git -C "$root" config --unset core.worktree 2>/dev/null
+
+  # register the worktree without checking anything out, then move the old
+  # working tree (incl. modified/untracked/ignored files) into it wholesale
+  git -C "$root" worktree add --no-checkout "$root/$name" "$branch" >/dev/null \
+    || { echo "✗ worktree registration failed — repo left bare at $root/.bare"; return 1; }
+  local f
+  while IFS= read -r f; do
+    case "$(basename "$f")" in .git|.bare|"$name") continue ;; esac
+    mv "$f" "$root/$name/" || return 1
+  done < <(find "$root" -mindepth 1 -maxdepth 1)
+
+  # reuse the old index so staged state (and stat cache) survives
+  if [ -f "$root/.bare/index" ]; then
+    mv "$root/.bare/index" "$root/.bare/worktrees/$name/index"
+  else
+    git -C "$root/$name" reset --quiet
+  fi
+
+  # origin plumbing, same as wtclone; tolerate being offline
+  if git -C "$root" remote get-url origin >/dev/null 2>&1; then
+    git -C "$root" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+    git -C "$root" fetch origin --quiet 2>/dev/null
+    git -C "$root" remote set-head origin --auto >/dev/null 2>&1
+  else
+    echo "⚠ no 'origin' remote — new branches will need an explicit base: wta <branch> <base>"
+  fi
+
+  mkdir -p "$root/.shared"
+  _wt_reg_add "$(basename "$root")" "$root"
+  echo "🌳 $(basename "$root") converted: worktree '$name' → branch $branch"
+  echo "   .shared/ store created — register files with: wtshare add <file>"
+  cd "$root/$name$rel" 2>/dev/null || cd "$root/$name" || return 1
 }
 
 # --- 2) create worktree -----------------------------------------------------
@@ -469,6 +547,14 @@ COMMANDS
       Clone once: sets up the container + default-branch worktree.
         wtclone git@github.com:you/repo.git       # -> ./repo/ with main/
         wtclone git@github.com:you/repo.git app    # custom container name
+
+  wtconvert [--name dir]
+      Convert an existing NON-BARE repo into a container, in place (run
+      from inside the repo). .git becomes .bare; the whole working tree —
+      including uncommitted, untracked and ignored files — moves into a
+      worktree named after the current branch. Auto-cd's into it.
+        cd ~/code/app && wtconvert     # -> app/ container with <branch>/
+        wtconvert --name main          # custom worktree dir name
 
   wta <branch> [base] [--name dir]
       Add a worktree (run from inside the container). Auto-cd's into it.
