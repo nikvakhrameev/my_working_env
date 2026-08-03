@@ -55,6 +55,24 @@ _wt_session() {  # tmux session name: <container>/<worktree>
                  "$(printf '%s' "$2" | tr ':.' '--')"
 }
 
+_wt_herdr_open() {  # (name, dir) - focus the herdr tab labeled "name" in the
+  # current workspace, creating it at "dir" if missing. No-op outside herdr.
+  [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 \
+    || { echo "⚠ herdr integration needs jq (brew install jq)" >&2; return 0; }
+  local name=$1 dir=$2 tab
+  tab=$(herdr tab list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null \
+        | jq -r --arg l "$name" \
+             'first(.result.tabs[] | select(.label == $l) | .tab_id) // empty')
+  if [ -n "$tab" ]; then
+    herdr tab focus "$tab" >/dev/null 2>&1
+  else
+    herdr tab create --workspace "$HERDR_WORKSPACE_ID" \
+      --cwd "$dir" --label "$name" --focus >/dev/null 2>&1
+  fi
+}
+
 # --- container registry ------------------------------------------------------
 # Machine-global map of known containers (name<TAB>path in $WT_REGISTRY) so
 # wtcd/wtl reach any repo from anywhere: `wtcd payx PAYX-1190`. Containers
@@ -317,10 +335,13 @@ wta() {
 
   # if we're in tmux — spin up a session for the worktree right away.
   # session name is <container>/<worktree> (see _wt_session).
+  # In herdr - a tab labeled after the worktree, in the current workspace.
   if [ -n "${TMUX:-}" ]; then
     local sess; sess=$(_wt_session "$(basename "$root")" "$name")
     tmux new-session -d -s "$sess" -c "$dir" 2>/dev/null
     tmux switch-client -t "=$sess"
+  else
+    _wt_herdr_open "$name" "$dir"
   fi
 }
 
@@ -472,10 +493,13 @@ wtcd() {
 
   # if we're in tmux — switch to the worktree's session, creating it first
   # if missing. Session name matches what wta creates: <container>/<worktree>.
+  # In herdr - switch to (or create) the tab labeled after the worktree.
   if [ -n "${TMUX:-}" ]; then
     local sess; sess=$(_wt_session "$(basename "$(dirname "$wt")")" "$(basename "$wt")")
     tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$wt"
     tmux switch-client -t "=$sess"
+  else
+    _wt_herdr_open "$(basename "$wt")" "$wt"
   fi
 }
 
@@ -605,6 +629,11 @@ COMMANDS
 tmux: inside tmux, wta and wtcd both switch to the worktree's session
 (named <container>/<worktree>), creating it if missing. Outside tmux,
 ignored.
+
+herdr: inside a herdr workspace (HERDR_ENV=1), wta and wtcd both switch
+to the tab labeled after the worktree in the current workspace, creating
+it (rooted at the worktree dir) if missing. Needs jq. tmux takes
+precedence when both are set.
 
 registry: containers self-register (on wtclone and whenever wt commands
 run inside them) into $WT_REGISTRY — a name<TAB>path file next to the
