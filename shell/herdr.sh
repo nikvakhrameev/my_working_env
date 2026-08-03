@@ -6,13 +6,9 @@
 # pane metadata and only set when it differs from the pane's tab label - so
 # it appears exactly when the tab name is misleading about what's checked out.
 #
-# Two reporters keep it fresh:
-#   - a precmd/PROMPT_COMMAND hook: instant update whenever a prompt returns
-#   - a per-pane background poller: picks up branch switches made by a
-#     running agent (no prompt returns while an agent works), using the
-#     pane's foreground cwd as tracked by herdr
-
-: "${HERDR_BRANCH_POLL_SECS:=5}"
+# Reported from a precmd/PROMPT_COMMAND hook, i.e. refreshed whenever a
+# prompt returns in the pane. While a foreground agent runs no prompt
+# returns, so the token updates once the agent yields - by design.
 
 _herdr_report_branch() {  # [dir] - report/clear this pane's branch token.
   # dir defaults to the pane's foreground cwd as seen by herdr.
@@ -38,13 +34,6 @@ _herdr_report_branch() {  # [dir] - report/clear this pane's branch token.
 
 _herdr_branch_precmd() { ( _herdr_report_branch "$PWD" & ) }
 
-_herdr_branch_poller() {  # ($1: parent shell pid) - stops when the shell exits
-  while kill -0 "$1" 2>/dev/null; do
-    _herdr_report_branch
-    sleep "$HERDR_BRANCH_POLL_SECS"
-  done
-}
-
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ] \
    && command -v herdr >/dev/null 2>&1; then
   if ! command -v jq >/dev/null 2>&1; then
@@ -58,11 +47,6 @@ if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ] \
         *";_herdr_branch_precmd;"*) ;;
         *) PROMPT_COMMAND="_herdr_branch_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
       esac
-    fi
-    # one poller per pane; exported so nested shells don't start a second one
-    if [ -z "${_HERDR_BRANCH_POLLER:-}" ]; then
-      export _HERDR_BRANCH_POLLER=1
-      ( _herdr_branch_poller $$ >/dev/null 2>&1 & )
     fi
   fi
 fi
