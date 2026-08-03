@@ -27,6 +27,7 @@ link tmux/tmux.conf           "$HOME/.tmux.conf"
 link tmux/session-preview.sh  "$HOME/.tmux/session-preview.sh"
 link shell/wt.sh              "$HOME/wt.sh"
 link shell/herdr.sh           "$HOME/herdr.sh"
+link herdr/config.toml        "$HOME/.config/herdr/config.toml"
 
 # --- wire the shell scripts into the shell rc -------------------------------
 # Pick the rc file from the user's LOGIN shell ($SHELL), not the interpreter

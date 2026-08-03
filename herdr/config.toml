@@ -1,0 +1,22 @@
+[ui.toast]
+delivery = "system"
+[keys]
+prefix = "ctrl+a"
+
+[ui]
+agent_panel_sort = "spaces"
+
+# Spaces rows: no "branch"/"git_status" - with one workspace per repo
+# container and one tab per worktree, a single workspace-level branch is
+# meaningless (it only ever showed the first pane's branch).
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"]]
+
+# Agent rows: $branch is reported by shell/herdr.sh (my_working_env) as pane
+# metadata, and only when the pane's git branch differs from its worktree
+# dir name - so it appears exactly when the tab name is misleading.
+[ui.sidebar.agents]
+rows = [["state_icon", "workspace", { token = "tab", fg = "#fab387" }, { token = "$branch", fg = "#fab387" }], ["agent"]]
+
+[terminal]
+new_cwd = "follow"
