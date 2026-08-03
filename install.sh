@@ -26,8 +26,9 @@ echo "Repo: $REPO"
 link tmux/tmux.conf           "$HOME/.tmux.conf"
 link tmux/session-preview.sh  "$HOME/.tmux/session-preview.sh"
 link shell/wt.sh              "$HOME/wt.sh"
+link shell/herdr.sh           "$HOME/herdr.sh"
 
-# --- wire wt.sh into the shell rc -----------------------------------------
+# --- wire the shell scripts into the shell rc -------------------------------
 # Pick the rc file from the user's LOGIN shell ($SHELL), not the interpreter
 # running this script — otherwise `bash install.sh` targets .bashrc for a zsh user.
 case "${SHELL##*/}" in
@@ -35,13 +36,17 @@ case "${SHELL##*/}" in
   bash) RC="$HOME/.bashrc" ;;
   *)    RC="$HOME/.zshrc"  ;;   # default to zsh on macOS
 esac
-LINE='source ~/wt.sh'
-if [ -f "$RC" ] && grep -qF "$LINE" "$RC"; then
-  echo "= $RC already sources wt.sh"
-else
-  printf '\n# bare-repo worktree helpers (my_working_env)\n%s\n' "$LINE" >> "$RC"
-  echo "→ appended '$LINE' to $RC"
-fi
+
+add_source() {  # add_source <line> <comment>
+  if [ -f "$RC" ] && grep -qF "$1" "$RC"; then
+    echo "= $RC already has '$1'"
+  else
+    printf '\n# %s\n%s\n' "$2" "$1" >> "$RC"
+    echo "→ appended '$1' to $RC"
+  fi
+}
+add_source 'source ~/wt.sh'    'bare-repo worktree helpers (my_working_env)'
+add_source 'source ~/herdr.sh' 'herdr shell integration (my_working_env)'
 
 # --- dependency check ------------------------------------------------------
 echo
