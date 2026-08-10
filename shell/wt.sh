@@ -327,7 +327,12 @@ wta() {
     else
       from=$(_wt_default_base)
     fi
-    git worktree add "$dir" -b "$branch" "$from" || return 1
+    # --no-track: branching off a remote-tracking ref would otherwise make the
+    # BASE the upstream (git's branch.autoSetupMerge default), so `git pull`
+    # would silently merge e.g. origin/dev into the new branch. With no
+    # upstream, the first `git push` sets it to origin/<branch> instead
+    # (needs push.autoSetupRemote=true, git 2.37+; otherwise push -u once).
+    git worktree add "$dir" -b "$branch" --no-track "$from" || return 1
     echo "＋ created branch $branch from $from"
   fi
 
@@ -592,8 +597,11 @@ COMMANDS
         wta hotfix main            # new branch off main
         wta feat/foo --name foo    # dir 'foo' instead of 'feat-foo'
       Existing local branch -> reuse; only on origin -> tracking branch;
-      nowhere -> create from base. Symlinks shared gitignored files from
-      the container's .shared store (see wtshare) into the new worktree.
+      nowhere -> create from base, with NO upstream (so `git pull` can't
+      merge the base into it - the first `git push` sets the upstream to
+      origin/<branch>; set push.autoSetupRemote=true to skip the -u).
+      Symlinks shared gitignored files from the container's .shared store
+      (see wtshare) into the new worktree.
 
   wtshare add <file>...
       Move gitignored file(s) into the container's .shared store and
