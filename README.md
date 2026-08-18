@@ -89,6 +89,7 @@ side by side, no stash-and-switch.
 myrepo/            <- container
 ├── .bare/         <- git data
 ├── .git           <- "gitdir: ./.bare"
+├── .shared/       <- shared gitignored files (see wtshare)
 ├── main/          <- worktree, branch main
 └── feat-x/        <- worktree, branch feat-x
 ```
@@ -97,6 +98,8 @@ myrepo/            <- container
 |---------|------|
 | `wtclone <url> [dir]` | clone once into a bare container + default-branch worktree |
 | `wta <branch> [base] [--name dir]` | add a worktree (reuse / track / create), auto-`cd` in |
+| `wtshare add <file>…` | move gitignored file(s) into `.shared`, symlink back |
+| `wtshare sync` | recreate this worktree's symlinks from `.shared` |
 | `wtl` | list worktrees (name + branch) |
 | `wtcd [name\|branch]` | jump between worktrees |
 | `wtrm <name\|branch> [-f]` | remove a worktree (branch is **kept**) |
@@ -104,8 +107,26 @@ myrepo/            <- container
 
 Inside tmux, `wta` spawns and switches to a session per worktree (named
 `<container>/<worktree>`), and `wtcd` switches to it if it exists — pairs with the
-`prefix + S` switcher above. `wta` also copies untracked `.env` / `.env.local` /
-`docker-compose.override.yml` from the default worktree into the new one.
+`prefix + S` switcher above.
+
+#### Shared gitignored files (`wtshare`)
+
+Gitignored files (`.env`, secrets, `node_modules/`, …) aren't tracked by git, so
+each worktree would otherwise start empty. Instead of copying, they live **once**
+in the container's `.shared/` store and every worktree gets a **symlink** back to
+it — so a `.env` edit in one worktree is instantly the same in all of them, on any
+branch. This mirrors a single-folder repo where you just switch branches.
+
+```sh
+wtshare add .env               # move .env into .shared/, replace with symlink
+wtshare add .env node_modules  # files or whole dirs
+wta feat-x                     # new worktree auto-symlinks everything in .shared
+wtshare sync                   # rebuild this worktree's symlinks from .shared
+```
+
+Shared paths are recorded in `.shared/.manifest`. `wta` symlinks every entry into
+each new worktree automatically. (Existing containers: no `.shared/` yet — it's
+created on the next `wtclone`, or just `mkdir` it and `wtshare add` your files.)
 
 Typical flow:
 
